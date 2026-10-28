@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: coread
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: BOOK_STORAGE_PROVIDER
+        value: supabase
+      - key: SUPABASE_STORAGE_BUCKET
+        value: coread-books
+      - key: FIREBASE_PROJECT_ID
+        value: coread-9bc50
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false

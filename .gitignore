@@ -1,0 +1,13 @@
+# Credentials belong in Render, never in this repository.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*service-account*.json
+*firebase-adminsdk*.json
+google-services.json
+__pycache__/
+.pytest_cache/
+.venv/
+*.log
