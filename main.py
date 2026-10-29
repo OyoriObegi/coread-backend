@@ -163,13 +163,17 @@ def _paragraphs_from_epub(raw):
 def content_start(book):
     """Keep preliminaries available, but start daily goals at the first real chapter."""
     heading = re.compile(r"^(?:chapter|chap\.?|part|book)\s+(?:1|one|i)\b(?:\s*[:.\-–—]\s*|\s+|$)", re.I)
-    candidates = [c["startParagraphIndex"] for c in book["chapters"] if heading.match(c["title"].strip())]
+    def first_heading(text):
+        text = text.strip()
+        # Contents lines may be extracted as headings too; their page numbers are not chapter starts.
+        return heading.match(text) and not re.search(r"\.{2,}", text) and (not re.search(r"\s\d+\s*$", text) or re.fullmatch(r"(?:chapter|chap\.?|part|book)\s+1", text, re.I))
+    candidates = [c["startParagraphIndex"] for c in book["chapters"] if first_heading(c["title"])]
     if candidates:
         return min(candidates)
     # A short standalone chapter heading is safer than searching body prose or TOC entries.
     for p in book["paragraphs"]:
         text = p["text"].strip()
-        if len(text) <= 100 and heading.match(text) and not re.search(r"\.{2,}", text) and (not re.search(r"\s\d+\s*$", text) or re.fullmatch(r"(?:chapter|chap\.?|part|book)\s+1", text, re.I)):
+        if len(text) <= 100 and first_heading(text):
             return p["index"]
     return 0
 
