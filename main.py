@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import tempfile
+import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -60,12 +61,22 @@ def identifier(value):
         raise HTTPException(422, "Invalid identifier")
     return value
 
+def owner(data, user):
+    # Existing circles preserve creator-first membership order.
+    if user["uid"] != data.get("ownerId", next(iter(data.get("memberIds", [])), None)):
+        raise HTTPException(403, "Only the circle creator can manage this circle")
+
+def available(data):
+    if data.get("managementOperation"):
+        raise HTTPException(409, "Circle maintenance in progress; try again shortly")
+
 def member(group_id, user):
     db, bucket = services()
     ref = db.collection("groups").document(identifier(group_id))
     data = ref.get().to_dict()
     if not data or user["uid"] not in data.get("memberIds", []):
         raise HTTPException(403, "Group membership required")
+    available(data)
     return db, bucket, ref, data
 
 def paragraph(text, items):
@@ -149,6 +160,19 @@ def _paragraphs_from_epub(raw):
     title = book.get_metadata("DC", "title")
     return {"metadata": {"title": title[0][0] if title else "", "pageCount": 0}, "chapters": chapters, "paragraphs": paragraphs}
 
+def content_start(book):
+    """Keep preliminaries available, but start daily goals at the first real chapter."""
+    heading = re.compile(r"^(?:chapter|chap\.?|part|book)\s+(?:1|one|i)\b(?:\s*[:.\-–—]\s*|\s+|$)", re.I)
+    candidates = [c["startParagraphIndex"] for c in book["chapters"] if heading.match(c["title"].strip())]
+    if candidates:
+        return min(candidates)
+    # A short standalone chapter heading is safer than searching body prose or TOC entries.
+    for p in book["paragraphs"]:
+        text = p["text"].strip()
+        if len(text) <= 100 and heading.match(text) and not re.search(r"\.{2,}", text) and (not re.search(r"\s\d+\s*$", text) or re.fullmatch(r"(?:chapter|chap\.?|part|book)\s+1", text, re.I)):
+            return p["index"]
+    return 0
+
 def load_book(bucket, group_id, book_id):
     try:
         return json.loads(gzip.decompress(bucket.blob(f"groups/{group_id}/books/{identifier(book_id)}.json").download_as_bytes()))
@@ -165,6 +189,7 @@ def health():
 async def convert(groupId: str = Form(...), bookId: str = Form(...), file: UploadFile = File(...), user=Depends(identity)):
     db, bucket, ref, group = await run_in_threadpool(member, groupId, user)
     identifier(bookId)
+    owner(group, user)
     chunks, size = [], 0
     while chunk := await file.read(1024 * 1024):
         size += len(chunk)
@@ -182,20 +207,35 @@ async def convert(groupId: str = Form(...), bookId: str = Form(...), file: Uploa
     payload["metadata"]["title"] = payload["metadata"]["title"] or Path(file.filename).stem
     payload.update({"groupId": groupId, "bookId": bookId})
     payload["metadata"]["chapterCount"] = len(payload["chapters"])
+    start = content_start(payload)
+    payload["metadata"]["contentStartParagraphIndex"] = start
     def save():
         from google.cloud import firestore
         transaction = db.transaction()
         @firestore.transactional
         def reserve(tx):
             current = ref.get(transaction=tx).to_dict()
+            owner(current, user)
+            available(current)
             if current.get("activeBookId") or current.get("importingBookId"):
                 raise HTTPException(409, "This group already has a book or an import in progress")
+            if bookId in current.get("retiredBookIds", []):
+                raise HTTPException(409, "Choose a new identifier for the replacement book")
             tx.update(ref, {"importingBookId": bookId})
         reserve(transaction)
         try:
             blob = bucket.blob(f"groups/{groupId}/books/{bookId}.json")
             blob.upload_from_string(gzip.compress(json.dumps(payload, ensure_ascii=False).encode()), content_type="application/gzip")
-            ref.update({"activeBookId": bookId, "importingBookId": None, "paragraphCount": len(payload["paragraphs"]), "bookTitle": payload["metadata"]["title"], "startParagraphIndex": 0, "endParagraphIndex": min(9, len(payload["paragraphs"])-1), "deadline": datetime.now(timezone.utc) + timedelta(days=1)})
+            @firestore.transactional
+            def finish(tx):
+                current = ref.get(transaction=tx).to_dict()
+                owner(current, user)
+                if current.get("importingBookId") != bookId:
+                    raise HTTPException(409, "Import reservation changed")
+                tx.update(ref, {"activeBookId": bookId, "importingBookId": None, "paragraphCount": len(payload["paragraphs"]), "bookTitle": payload["metadata"]["title"], "contentStartParagraphIndex": start, "startParagraphIndex": start, "endParagraphIndex": milestone_end(payload, start, current["dailyTargetType"], current["dailyTargetValue"]), "completed": False, "deadline": datetime.now(timezone.utc) + timedelta(days=1)})
+                for uid in current["memberIds"]:
+                    tx.update(ref.collection("members").document(uid), {"verifiedThrough": start-1, "bookId": bookId})
+            finish(db.transaction())
         except Exception:
             ref.update({"importingBookId": None})
             raise
@@ -204,7 +244,9 @@ async def convert(groupId: str = Form(...), bookId: str = Form(...), file: Uploa
 
 @app.get("/groups/{group_id}/books/{book_id}")
 def download(group_id: str, book_id: str, user=Depends(identity)):
-    _, bucket, _, _ = member(group_id, user)
+    _, bucket, _, group = member(group_id, user)
+    if book_id != group.get("activeBookId"):
+        raise HTTPException(404, "Book no longer belongs to this circle")
     blob = bucket.blob(f"groups/{group_id}/books/{identifier(book_id)}.json")
     if not blob.exists():
         raise HTTPException(404, "Book not found")
@@ -237,7 +279,7 @@ def create_group(body: CreateGroup, user=Depends(identity)):
     db, _ = services()
     ref = db.collection("groups").document()
     now = datetime.now(timezone.utc)
-    ref.set({"name": body.name, "memberIds": [user["uid"]], "invitedEmails": [email], "activeBookId": None, "currentDayNumber": 1, "startParagraphIndex": 0, "endParagraphIndex": 0, "dailyTargetType": "custom", "dailyTargetValue": 10, "streakCount": 0, "lastStreakEvalDate": "", "lastCompletedDay": 0, "pauseTokensRemaining": 3, "pauseMonth": now.strftime("%Y-%m"), "pauseRequestedBy": None, "pendingRequest": None, "deadline": now + timedelta(days=1)})
+    ref.set({"ownerId": user["uid"], "bookFirstDay": 1, "name": body.name, "memberIds": [user["uid"]], "invitedEmails": [email], "activeBookId": None, "currentDayNumber": 1, "startParagraphIndex": 0, "endParagraphIndex": 0, "dailyTargetType": "custom", "dailyTargetValue": 10, "streakCount": 0, "lastStreakEvalDate": "", "lastCompletedDay": 0, "pauseTokensRemaining": 3, "pauseMonth": now.strftime("%Y-%m"), "pauseRequestedBy": None, "pendingRequest": None, "deadline": now + timedelta(days=1)})
     ref.collection("members").document(user["uid"]).set({"email": user["email"], "verifiedThrough": -1})
     url = f"{os.getenv('APP_LINK_ORIGIN', 'https://coread.app')}/invite?groupId={ref.id}"
     sent = False
@@ -257,12 +299,13 @@ def join(group_id: str, user=Depends(identity)):
         data = ref.get(transaction=tx).to_dict()
         if not data:
             raise HTTPException(404, "Group not found")
+        available(data)
         if user["uid"] in data["memberIds"]:
             return
         email = user["email"].lower()
         if email not in data["invitedEmails"] or len(data["memberIds"]) >= 2:
             raise HTTPException(403, "No invitation for this email")
-        tx.update(ref, {"memberIds": data["memberIds"] + [user["uid"]], "invitedEmails": [e for e in data["invitedEmails"] if e != email]})
+        tx.update(ref, {"ownerId": data.get("ownerId", data["memberIds"][0]), "memberIds": data["memberIds"] + [user["uid"]], "invitedEmails": [e for e in data["invitedEmails"] if e != email]})
         tx.set(ref.collection("members").document(user["uid"]), {"email": email, "verifiedThrough": data["startParagraphIndex"] - 1})
     accept(db.transaction())
     return {"groupId": group_id}
@@ -306,10 +349,11 @@ def action(group_id: str, body: Action, user=Depends(identity)):
     from google.cloud import firestore
     db, bucket, ref, initial = member(group_id, user)
     now, uid = datetime.now(timezone.utc), user["uid"]
-    book = load_book(bucket, group_id, initial["activeBookId"]) if initial.get("activeBookId") else None
+    book = load_book(bucket, group_id, initial["activeBookId"]) if initial.get("activeBookId") and body.kind in {"commentary", "pace", "pause", "evaluate"} else None
     @firestore.transactional
     def apply(tx):
         g = ref.get(transaction=tx).to_dict()
+        available(g)
         if uid not in g["memberIds"]:
             raise HTTPException(403, "Group membership required")
         if g.get("activeBookId") != initial.get("activeBookId"):
@@ -317,7 +361,7 @@ def action(group_id: str, body: Action, user=Depends(identity)):
         mref = ref.collection("members").document(uid)
         me = mref.get(transaction=tx).to_dict() or {}
         day = body.dayNumber or g["currentDayNumber"]
-        if day < 1 or day > g["currentDayNumber"]:
+        if day < g.get("bookFirstDay", 1) or day > g["currentDayNumber"]:
             raise HTTPException(422, "Invalid reflection day")
         cref = ref.collection("commentaries").document(f"{day}_{uid}")
         if body.kind == "commentary":
@@ -333,6 +377,11 @@ def action(group_id: str, body: Action, user=Depends(identity)):
             if old and now > old["revisionDeadline"]:
                 raise HTTPException(409, "Revision window has ended")
             tx.set(cref, {"uid": uid, "dayNumber": day, "text": body.text, "quoteIndex": body.quoteIndex, "startParagraphIndex": start, "endParagraphIndex": end, "status": "PENDING_REVIEW", "createdAt": old["createdAt"] if old else now, "updatedAt": now})
+        elif body.kind == "withdraw_reflection":
+            entry = cref.get(transaction=tx).to_dict()
+            if not entry or entry.get("status") != "PENDING_REVIEW" or entry.get("reviewedBy") or g.get("lastCompletedDay", 0) >= day:
+                raise HTTPException(409, "This reflection has already been reviewed or completed")
+            tx.delete(cref)
         elif body.kind in {"approve", "revise"}:
             target = body.target
             target_ref = ref.collection("commentaries").document(f"{day}_{target}")
@@ -350,11 +399,20 @@ def action(group_id: str, body: Action, user=Depends(identity)):
             if not book:
                 raise HTTPException(422, "Import a book first")
             end = milestone_end(book, g["startParagraphIndex"], body.mode, body.value) if body.kind == "pace" else g["endParagraphIndex"]
-            tx.update(ref, {"pendingRequest": {"kind": body.kind, "requestedBy": uid, "mode": body.mode, "value": body.value, "end": end}, "pauseRequestedBy": uid if body.kind == "pause" else None})
+            tx.update(ref, {"pendingRequest": {"id": uuid.uuid4().hex, "kind": body.kind, "requestedBy": uid, "mode": body.mode, "value": body.value, "end": end}, "pauseRequestedBy": uid if body.kind == "pause" else None})
+        elif body.kind == "cancel":
+            pending = g.get("pendingRequest")
+            if not pending or pending["requestedBy"] != uid:
+                raise HTTPException(403, "Only the requester can cancel a pending request")
+            if pending.get("id") and body.target != pending["id"]:
+                raise HTTPException(409, "This request has changed; refresh and try again")
+            tx.update(ref, {"pendingRequest": None, "pauseRequestedBy": None})
         elif body.kind in {"accept", "reject"}:
             pending = g.get("pendingRequest")
             if not pending or pending["requestedBy"] == uid:
                 raise HTTPException(403, "Only your partner can respond")
+            if pending.get("id") and body.target != pending["id"]:
+                raise HTTPException(409, "This request has changed; refresh and try again")
             update = {"pendingRequest": None, "pauseRequestedBy": None}
             if body.kind == "accept":
                 if pending["kind"] == "pause":
@@ -392,6 +450,89 @@ def action(group_id: str, body: Action, user=Depends(identity)):
         notify(ref, user["uid"], "Your reflection needs a revision. You have 12 hours to respond.")
     return {"status": "ok"}
 
+class ManageCircle(BaseModel):
+    kind: str
+    name: str = Field(default="", max_length=100)
+    bookId: str = ""
+
+@app.post("/groups/{group_id}/manage")
+def manage_circle(group_id: str, body: ManageCircle, user=Depends(identity)):
+    from google.cloud import firestore
+    db, bucket = services()
+    ref = db.collection("groups").document(identifier(group_id))
+    if body.kind not in {"rename", "remove_book", "delete_circle", "skip_preliminaries"}:
+        raise HTTPException(422, "Unknown circle operation")
+    book = None
+    if body.kind == "skip_preliminaries":
+        _, _, _, current = member(group_id, user)
+        owner(current, user)
+        if body.bookId != current.get("activeBookId"):
+            raise HTTPException(409, "The book changed; refresh first")
+        book = load_book(bucket, group_id, body.bookId)
+    @firestore.transactional
+    def reserve(tx):
+        g = ref.get(transaction=tx).to_dict()
+        if not g:
+            raise HTTPException(404, "Circle not found")
+        owner(g, user)
+        if g.get("importingBookId"):
+            raise HTTPException(409, "Wait for the book import to finish")
+        # A failed delete may be retried by its owner. Other operations stay blocked.
+        operation = g.get("managementOperation")
+        if operation and operation != body.kind:
+            raise HTTPException(409, "Finish the pending circle operation first")
+        if body.kind == "skip_preliminaries":
+            if g.get("activeBookId") != body.bookId or g["currentDayNumber"] != g.get("bookFirstDay", 1):
+                raise HTTPException(409, "The book has changed or reading has already advanced")
+            start = content_start(book)
+            if start <= g["startParagraphIndex"]:
+                raise HTTPException(422, "No later first chapter could be identified")
+            entries = [ref.collection("commentaries").document(f"{g['currentDayNumber']}_{uid}").get(transaction=tx).to_dict() for uid in g["memberIds"]]
+            members = [(ref.collection("members").document(uid), ref.collection("members").document(uid).get(transaction=tx).to_dict() or {}) for uid in g["memberIds"]]
+            if any(entries) or g.get("pendingRequest"):
+                raise HTTPException(409, "Recall pending requests and reflections before changing the first reading range")
+            tx.update(ref, {"startParagraphIndex": start, "endParagraphIndex": milestone_end(book, start, g["dailyTargetType"], g["dailyTargetValue"]), "contentStartParagraphIndex": start})
+            for member_ref, data in members:
+                if data.get("verifiedThrough", -1) < start-1:
+                    tx.update(member_ref, {"verifiedThrough": start-1})
+        elif body.kind == "rename":
+            if not body.name.strip():
+                raise HTTPException(422, "Enter a circle name")
+            tx.update(ref, {"name": body.name.strip(), "ownerId": user["uid"]})
+        else:
+            if body.kind == "remove_book" and body.bookId != (g.get("activeBookId") or ""):
+                raise HTTPException(409, "The book changed; refresh before deleting")
+            tx.update(ref, {"managementOperation": body.kind, "ownerId": user["uid"]})
+        return dict(g)
+    g = reserve(db.transaction())
+    if body.kind in {"rename", "skip_preliminaries"}:
+        return {"status": "ok"}
+    # Keep the group document until all cleanup succeeds, so failures can be retried.
+    if g.get("activeBookId"):
+        blob = bucket.blob(f"groups/{group_id}/books/{identifier(g['activeBookId'])}.json")
+        try:
+            blob.delete()
+        except Exception as exc:
+            if getattr(exc, "status_code", None) != 404 and getattr(exc, "code", None) != 404:
+                raise
+    if body.kind == "delete_circle":
+        for collection in ("commentaries", "messages", "nudges", "members"):
+            db.recursive_delete(ref.collection(collection))
+        ref.delete()
+    else:
+        # Keep day numbers unique across books; earlier reflections cannot unlock the replacement.
+        @firestore.transactional
+        def finish(tx):
+            current = ref.get(transaction=tx).to_dict()
+            if current.get("managementOperation") != "remove_book":
+                raise HTTPException(409, "Circle operation changed")
+            day = current["currentDayNumber"] + 1
+            tx.update(ref, {"activeBookId": None, "retiredBookIds": current.get("retiredBookIds", []) + ([current["activeBookId"]] if current.get("activeBookId") else []), "bookTitle": "Choose your next book", "paragraphCount": 0, "startParagraphIndex": 0, "endParagraphIndex": 0, "contentStartParagraphIndex": 0, "currentDayNumber": day, "bookFirstDay": day, "completed": False, "pendingRequest": None, "pauseRequestedBy": None, "managementOperation": None})
+            for uid in current["memberIds"]:
+                tx.update(ref.collection("members").document(uid), {"verifiedThrough": -1, "bookId": ""})
+        finish(db.transaction())
+    return {"status": "ok"}
+
 def notify(ref, sender, text):
     from firebase_admin import messaging
     tokens = [m.to_dict().get("fcmToken") for m in ref.collection("members").stream() if m.id != sender]
@@ -409,6 +550,9 @@ def nudge(group_id: str, user=Depends(identity)):
     @firestore.transactional
     def reserve(tx):
         current = ref.get(transaction=tx).to_dict()
+        available(current)
+        if user["uid"] not in current.get("memberIds", []):
+            raise HTTPException(403, "Group membership required")
         if current.get("lastNudgeAt") and now-current["lastNudgeAt"] < timedelta(minutes=30):
             raise HTTPException(429, "Try again after 30 minutes")
         tx.update(ref, {"lastNudgeAt": now})
@@ -433,7 +577,7 @@ def ai(group_id: str, body: Action, user=Depends(identity)):
     entries = []
     if body.kind == "mediate":
         day = body.dayNumber or g["currentDayNumber"]
-        if not 1 <= day <= g["currentDayNumber"]:
+        if not g.get("bookFirstDay", 1) <= day <= g["currentDayNumber"]:
             raise HTTPException(422, "Invalid reflection day")
         from google.cloud.firestore_v1.base_query import FieldFilter
         entries = [e.to_dict() for e in ref.collection("commentaries").where(filter=FieldFilter("dayNumber", "==", day)).stream()]

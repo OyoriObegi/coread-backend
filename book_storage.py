@@ -34,7 +34,9 @@ class SupabaseBucket:
         endpoint = self.url + "/storage/v1/object/"
         if method == "GET":
             endpoint += "authenticated/"
-        endpoint += quote(self.name, safe="") + "/" + quote(path, safe="/")
+        endpoint += quote(self.name, safe="")
+        if method != "DELETE":
+            endpoint += "/" + quote(path, safe="/")
         try:
             with httpx.Client(timeout=90, transport=self.transport, follow_redirects=False) as client:
                 response = client.request(method, endpoint, headers=headers, **kwargs)
@@ -56,6 +58,10 @@ class SupabaseBlob:
     def upload_from_string(self, data, content_type="application/gzip"):
         self.bucket.request("POST", self.path, content=data,
                             headers={"Content-Type": content_type, "x-upsert": "true"})
+        self.cached = None
+
+    def delete(self):
+        self.bucket.request("DELETE", self.path, json={"prefixes": [self.path]})
         self.cached = None
 
     def download_as_bytes(self):
