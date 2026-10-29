@@ -41,4 +41,8 @@ New imports start daily goals at a detected Chapter One/Part One marker. Prelimi
 The Android app stores reading position separately from verified progress, per account, circle and book. This is local device storage and does not synchronize the scroll position between devices.
 
 ## Updating an existing service
-After pushing this update, use Render Manual Deploy > Deploy latest commit when deploying from a public Git URL. Deploy the matching Firestore rules and install CoRead 1.0.2. No new environment variables, billing plan changes or paid services are required.
+After pushing this update, use Render Manual Deploy > Deploy latest commit when deploying from a public Git URL. The matching Firestore rules are deployed. Install CoRead 1.0.4. No new environment variables, billing plan changes or paid services are required.
+
+
+## Reading history and streak milestones
+The server keeps a metadata-only reading history for each circle book: title, paragraph count, per-member verified position, start and finish dates, and whether the reader finished or moved on. It does not retain deleted book text. The bookshelf in CoRead 1.0.4 shows current and archived books with each reader's progress. Existing Day numbering continues across a book replacement. Best streak and the 3, 7, 14 and 30 day milestone badges remain with the circle.

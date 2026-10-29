@@ -185,6 +185,22 @@ def load_book(bucket, group_id, book_id):
     except Exception as exc:
         raise HTTPException(404, "Book unavailable") from exc
 
+def reading_history(group, book_id, members, previous=None):
+    """Metadata and verified positions only; removed book text is never retained here."""
+    previous = previous or {}
+    return {
+        "bookId": book_id,
+        "title": group.get("bookTitle") or previous.get("title") or "Untitled book",
+        "paragraphCount": group.get("paragraphCount", previous.get("paragraphCount", 0)),
+        "readingStartParagraphIndex": group.get("contentStartParagraphIndex", previous.get("readingStartParagraphIndex", 0)),
+        "startedAt": previous.get("startedAt") or group.get("bookStartedAt"),
+        "status": "completed" if group.get("completed") else "active",
+        "completed": bool(group.get("completed")),
+        "verifiedThroughByUid": {uid: data.get("verifiedThrough", -1) for uid, data in members.items()},
+        "finishedAt": previous.get("finishedAt"),
+        "removedAt": previous.get("removedAt"),
+    }
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -236,7 +252,10 @@ async def convert(groupId: str = Form(...), bookId: str = Form(...), file: Uploa
                 owner(current, user)
                 if current.get("importingBookId") != bookId:
                     raise HTTPException(409, "Import reservation changed")
-                tx.update(ref, {"activeBookId": bookId, "importingBookId": None, "paragraphCount": len(payload["paragraphs"]), "bookTitle": payload["metadata"]["title"], "contentStartParagraphIndex": start, "startParagraphIndex": start, "endParagraphIndex": milestone_end(payload, start, current["dailyTargetType"], current["dailyTargetValue"]), "completed": False, "deadline": datetime.now(timezone.utc) + timedelta(days=1)})
+                started = datetime.now(timezone.utc)
+                imported = {"activeBookId": bookId, "importingBookId": None, "paragraphCount": len(payload["paragraphs"]), "bookTitle": payload["metadata"]["title"], "contentStartParagraphIndex": start, "startParagraphIndex": start, "endParagraphIndex": milestone_end(payload, start, current["dailyTargetType"], current["dailyTargetValue"]), "completed": False, "bookStartedAt": started, "deadline": started + timedelta(days=1)}
+                tx.update(ref, imported)
+                tx.set(ref.collection("readingHistory").document(bookId), reading_history(imported, bookId, {uid: {"verifiedThrough": start-1} for uid in current["memberIds"]}))
                 for uid in current["memberIds"]:
                     tx.update(ref.collection("members").document(uid), {"verifiedThrough": start-1, "bookId": bookId})
             finish(db.transaction())
@@ -283,7 +302,7 @@ def create_group(body: CreateGroup, user=Depends(identity)):
     db, _ = services()
     ref = db.collection("groups").document()
     now = datetime.now(timezone.utc)
-    ref.set({"ownerId": user["uid"], "bookFirstDay": 1, "name": body.name, "memberIds": [user["uid"]], "invitedEmails": [email], "activeBookId": None, "currentDayNumber": 1, "startParagraphIndex": 0, "endParagraphIndex": 0, "dailyTargetType": "custom", "dailyTargetValue": 10, "streakCount": 0, "lastStreakEvalDate": "", "lastCompletedDay": 0, "pauseTokensRemaining": 3, "pauseMonth": now.strftime("%Y-%m"), "pauseRequestedBy": None, "pendingRequest": None, "deadline": now + timedelta(days=1)})
+    ref.set({"ownerId": user["uid"], "bookFirstDay": 1, "name": body.name, "memberIds": [user["uid"]], "invitedEmails": [email], "activeBookId": None, "currentDayNumber": 1, "startParagraphIndex": 0, "endParagraphIndex": 0, "dailyTargetType": "custom", "dailyTargetValue": 10, "streakCount": 0, "bestStreak": 0, "lastStreakEvalDate": "", "lastCompletedDay": 0, "pauseTokensRemaining": 3, "pauseMonth": now.strftime("%Y-%m"), "pauseRequestedBy": None, "pendingRequest": None, "deadline": now + timedelta(days=1)})
     ref.collection("members").document(user["uid"]).set({"email": user["email"], "verifiedThrough": -1})
     url = f"{os.getenv('APP_LINK_ORIGIN', 'https://coread.app')}/invite?groupId={ref.id}"
     sent = False
@@ -440,12 +459,18 @@ def action(group_id: str, body: Action, user=Depends(identity)):
             yesterday = (now - timedelta(days=1)).date().isoformat()
             last_date = g.get("lastStreakEvalDate", "")
             streak = g["streakCount"] if last_date == today else g["streakCount"] + 1 if last_date == yesterday else 1
-            update = {"streakCount": streak, "lastStreakEvalDate": today, "lastCompletedDay": day}
+            update = {"streakCount": streak, "bestStreak": max(g.get("bestStreak", 0), g["streakCount"], streak), "lastStreakEvalDate": today, "lastCompletedDay": day}
             if book and g["endParagraphIndex"]+1 < len(book["paragraphs"]):
                 start = g["endParagraphIndex"]+1
                 update.update({"currentDayNumber": day+1, "startParagraphIndex": start, "endParagraphIndex": milestone_end(book, start, g["dailyTargetType"], g["dailyTargetValue"]), "deadline": max(now, g["deadline"]) + timedelta(days=1)})
             else:
                 update["completed"] = True
+                if g.get("activeBookId"):
+                    history_ref = ref.collection("readingHistory").document(g["activeBookId"])
+                    previous = history_ref.get(transaction=tx).to_dict()
+                    history = reading_history(g, g["activeBookId"], dict(zip(g["memberIds"], members)), previous)
+                    history.update({"status": "completed", "completed": True, "finishedAt": now})
+                    tx.set(history_ref, history)
             tx.update(ref, update)
         else:
             raise HTTPException(422, "Unknown action")
@@ -493,9 +518,13 @@ def manage_circle(group_id: str, body: ManageCircle, user=Depends(identity)):
                 raise HTTPException(422, "No later first chapter could be identified")
             entries = [ref.collection("commentaries").document(f"{g['currentDayNumber']}_{uid}").get(transaction=tx).to_dict() for uid in g["memberIds"]]
             members = [(ref.collection("members").document(uid), ref.collection("members").document(uid).get(transaction=tx).to_dict() or {}) for uid in g["memberIds"]]
+            history_ref = ref.collection("readingHistory").document(body.bookId)
+            previous = history_ref.get(transaction=tx).to_dict()
             if any(entries) or g.get("pendingRequest"):
                 raise HTTPException(409, "Recall pending requests and reflections before changing the first reading range")
             tx.update(ref, {"startParagraphIndex": start, "endParagraphIndex": milestone_end(book, start, g["dailyTargetType"], g["dailyTargetValue"]), "contentStartParagraphIndex": start})
+            history_group = {**g, "contentStartParagraphIndex": start}
+            tx.set(history_ref, reading_history(history_group, body.bookId, {member_ref.id: {**data, "verifiedThrough": max(data.get("verifiedThrough", -1), start-1)} for member_ref, data in members}, previous))
             for member_ref, data in members:
                 if data.get("verifiedThrough", -1) < start-1:
                     tx.update(member_ref, {"verifiedThrough": start-1})
@@ -504,6 +533,8 @@ def manage_circle(group_id: str, body: ManageCircle, user=Depends(identity)):
                 raise HTTPException(422, "Enter a circle name")
             tx.update(ref, {"name": body.name.strip(), "ownerId": user["uid"]})
         else:
+            if body.kind == "remove_book" and not g.get("activeBookId"):
+                raise HTTPException(409, "There is no book to remove")
             if body.kind == "remove_book" and body.bookId != (g.get("activeBookId") or ""):
                 raise HTTPException(409, "The book changed; refresh before deleting")
             tx.update(ref, {"managementOperation": body.kind, "ownerId": user["uid"]})
@@ -520,7 +551,7 @@ def manage_circle(group_id: str, body: ManageCircle, user=Depends(identity)):
             if getattr(exc, "status_code", None) != 404 and getattr(exc, "code", None) != 404:
                 raise
     if body.kind == "delete_circle":
-        for collection in ("commentaries", "messages", "nudges", "members"):
+        for collection in ("commentaries", "messages", "nudges", "readingHistory", "members"):
             db.recursive_delete(ref.collection(collection))
         ref.delete()
     else:
@@ -530,7 +561,13 @@ def manage_circle(group_id: str, body: ManageCircle, user=Depends(identity)):
             current = ref.get(transaction=tx).to_dict()
             if current.get("managementOperation") != "remove_book":
                 raise HTTPException(409, "Circle operation changed")
+            history_ref = ref.collection("readingHistory").document(current["activeBookId"])
+            previous = history_ref.get(transaction=tx).to_dict()
+            members = {uid: ref.collection("members").document(uid).get(transaction=tx).to_dict() or {} for uid in current["memberIds"]}
+            history = reading_history(current, current["activeBookId"], members, previous)
+            history.update({"status": "completed" if current.get("completed") else "stopped", "removedAt": datetime.now(timezone.utc)})
             day = current["currentDayNumber"] + 1
+            tx.set(history_ref, history)
             tx.update(ref, {"activeBookId": None, "retiredBookIds": current.get("retiredBookIds", []) + ([current["activeBookId"]] if current.get("activeBookId") else []), "bookTitle": "Choose your next book", "paragraphCount": 0, "startParagraphIndex": 0, "endParagraphIndex": 0, "contentStartParagraphIndex": 0, "currentDayNumber": day, "bookFirstDay": day, "completed": False, "pendingRequest": None, "pauseRequestedBy": None, "managementOperation": None})
             for uid in current["memberIds"]:
                 tx.update(ref.collection("members").document(uid), {"verifiedThrough": -1, "bookId": ""})
