@@ -7,7 +7,7 @@ local.properties
 build/
 __pycache__/
 .pytest_cache/
-/.pytest-*/
+.pytest-*/
 .venv/
 *.apk
 *.aab
