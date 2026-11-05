@@ -1,0 +1,10 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /groups/{gid}/books/{book} {
+      allow read: if request.auth != null && request.auth.token.email_verified == true
+        && request.auth.uid in firestore.get(/databases/(default)/documents/groups/$(gid)).data.memberIds;
+      allow write: if false;
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "commentaries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "dayNumber",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "uid",
+          "order": "ASCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "commentaries",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "dayNumber",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "endParagraphIndex",
+          "order": "ASCENDING"
+        }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

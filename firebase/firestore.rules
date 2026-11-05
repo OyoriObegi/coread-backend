@@ -1,0 +1,42 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signed() { return request.auth != null && request.auth.token.email_verified == true; }
+    function member(gid) { return signed() && request.auth.uid in get(/databases/$(database)/documents/groups/$(gid)).data.memberIds && get(/databases/$(database)/documents/groups/$(gid)).data.get("managementOperation", null) == null; }
+    match /groups/{gid} {
+      allow read: if signed() && request.auth.uid in resource.data.memberIds;
+      // Membership, invitations, milestones and streaks are changed by authenticated API transactions.
+      allow write: if false;
+      match /members/{uid} {
+        allow read: if member(gid);
+        allow update: if member(gid) && uid == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['verifiedThrough','lastActive','fcmToken','bookId'])
+          && (!('bookId' in request.resource.data) || request.resource.data.bookId == get(/databases/$(database)/documents/groups/$(gid)).data.activeBookId)
+          && request.resource.data.verifiedThrough is int
+          && request.resource.data.verifiedThrough >= resource.data.verifiedThrough
+          && (request.resource.data.verifiedThrough == -1 ||
+              request.resource.data.verifiedThrough < get(/databases/$(database)/documents/groups/$(gid)).data.paragraphCount);
+        allow create, delete: if false;
+      }
+      match /readingHistory/{book} {
+        allow read: if member(gid);
+        allow write: if false;
+      }
+      match /commentaries/{entry} {
+        // Avoid exposing spoilers by enforcing the same unlock gate as the UI.
+        allow read: if member(gid) && (resource.data.uid == request.auth.uid
+          || get(/databases/$(database)/documents/groups/$(gid)/members/$(request.auth.uid)).data.verifiedThrough >= resource.data.endParagraphIndex);
+        allow write: if false;
+      }
+      match /messages/{message} {
+        allow read: if member(gid);
+        allow create: if member(gid) && request.resource.data.keys().hasOnly(['uid','text','paragraphIndex','createdAt'])
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.text is string && request.resource.data.text.size() > 0 && request.resource.data.text.size() <= 4000
+          && request.resource.data.paragraphIndex is int && request.resource.data.paragraphIndex >= -1
+          && request.resource.data.createdAt == request.time;
+        allow update, delete: if false;
+      }
+    }
+  }
+}

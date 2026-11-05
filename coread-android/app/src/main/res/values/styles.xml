@@ -1,0 +1,1 @@
+<resources><style name="Theme.CoRead" parent="android:style/Theme.Material.Light.NoActionBar"><item name="android:fontFamily">sans</item><item name="android:windowLightStatusBar">true</item><item name="android:statusBarColor">#FFF8F1</item><item name="android:navigationBarColor">#FFF8F1</item></style><color name="icon_background">#FFF1DE</color></resources>

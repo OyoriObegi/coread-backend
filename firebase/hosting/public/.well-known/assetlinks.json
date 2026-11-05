@@ -1,0 +1,14 @@
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.coread.app",
+      "sha256_cert_fingerprints": [
+        "9D:9A:45:34:65:48:89:25:DF:3F:37:D7:3F:6C:28:C9:AE:61:69:CF:52:F8:01:BB:88:9F:AC:50:D5:6C:0B:98"
+      ]
+    }
+  }
+]
