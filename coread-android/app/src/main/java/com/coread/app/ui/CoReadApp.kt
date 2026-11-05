@@ -1,6 +1,6 @@
 package com.coread.app.ui
-import android.app.Activity
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.LocalActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -21,7 +21,6 @@ import androidx.compose.ui.*
 import androidx.compose.ui.draw.blur
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.*
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -148,9 +147,6 @@ private val Pale=Color(0xFFF1E8DC)
  var name by remember { mutableStateOf("") };var email by remember { mutableStateOf("") };var groupId by remember { mutableStateOf("") };var pace by remember { mutableStateOf(false) }
  Page {
   Heading("Good books.\nBetter together.","Make room for a small, shared reading ritual.")
-  if(!s.signedIn) {
-   TextButton(onClick={showSignIn=true}){Text("Add a book and read with your partner")}
-  }
   if(s.group.id=="demo") Panel {
    Text("Start here",style=MaterialTheme.typography.labelLarge,color=Clay)
    Text("Try the sample book, then create or join a circle when you are ready to read together.")
@@ -170,6 +166,11 @@ private val Pale=Color(0xFFF1E8DC)
    }
    Button(onClick=onRead,modifier=Modifier.fillMaxWidth()){Text(if(done==0) "Start today's reading" else "Continue reading")}
    TextButton(onClick=onBookshelf){Text("View your bookshelf")}
+  }
+  if(!s.signedIn) Panel {
+   Button(onClick={showSignIn=true},modifier=Modifier.fillMaxWidth()) {
+    Text("Add a book and read with your partner")
+   }
   }
   s.group.pending?.let { p -> Panel {
    Text(p["kind"].toString()+" request",fontWeight=FontWeight.Bold)
@@ -211,10 +212,9 @@ private val Pale=Color(0xFFF1E8DC)
   onDismissRequest={showSignIn=false},
   title={Text("Sign in to add a book")},
   text={
-   Column(verticalArrangement=Arrangement.spacedBy(12.dp)) {
+   Column(Modifier.heightIn(max=420.dp).verticalScroll(rememberScrollState()),verticalArrangement=Arrangement.spacedBy(12.dp)) {
     Text("Sign in or create an account, then create or join a reading circle to share a book.")
     SignInOptions(vm,s)
-    if(s.notice.isNotBlank()) Text(s.notice,style=MaterialTheme.typography.bodySmall)
    }
   },
   confirmButton={TextButton(onClick={showSignIn=false}){Text("Close")}}
@@ -437,11 +437,23 @@ private val Pale=Color(0xFFF1E8DC)
  }
 }
 @Composable private fun SignInOptions(vm:ReaderViewModel,s:UiState) {
- val context=LocalContext.current
+ val activity=LocalActivity.current
  var email by rememberSaveable { mutableStateOf("") }
- Button(onClick={vm.google(context as Activity)},enabled=!s.busy){Text("Continue with Google")}
+ var showLink by rememberSaveable { mutableStateOf(false) }
+ var link by remember { mutableStateOf("") }
+ Button(onClick={activity?.let(vm::google)},enabled=!s.busy && activity!=null){Text("Continue with Google")}
  Field(email,{email=it},"Email address")
  OutlinedButton(onClick={vm.email(email)},enabled=email.contains('@')&&!s.busy){Text("Email a sign-in link")}
+ if(s.notice.isNotBlank()) Text(s.notice,style=MaterialTheme.typography.bodySmall)
+ if(s.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+ if(showLink) {
+  Field(link,{link=it},"Sign-in link from your email")
+  OutlinedButton(onClick={vm.finishEmailSignIn(email,link)},enabled=email.contains('@')&&link.isNotBlank()&&!s.busy) {
+   Text("Sign in with link")
+  }
+ } else {
+  TextButton(onClick={showLink=true}){Text("Paste a sign-in link")}
+ }
  if(!vm.auth.configured) Text("Local demo is ready. Shared reading needs your Firebase project configuration.",style=MaterialTheme.typography.bodySmall)
 }
 @Composable private fun Settings(vm:ReaderViewModel,s:UiState,onBack:()->Unit) {

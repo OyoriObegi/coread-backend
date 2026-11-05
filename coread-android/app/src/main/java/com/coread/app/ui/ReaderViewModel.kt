@@ -6,6 +6,7 @@ import android.provider.OpenableColumns
 import android.os.SystemClock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.paging.*
 import com.coread.app.data.*
 import com.coread.app.domain.DwellTracker
@@ -134,13 +135,30 @@ data class ImportPreview(
   if(elapsed>0) db.reading().log(ReadingSessionLogEntity(startTime=end-elapsed,endTime=end,paragraphsRead=count,averageWpm=words*60000.0/elapsed))
  }
  fun highlight(index:Int)=run { withContext(Dispatchers.IO) { db.reading().toggleHighlight(book.value,index);refreshProgress() };touch() }
- fun google(activity:Activity)=run { auth.google(activity);signedIn() }
- fun email(address:String)=run { auth.email(address);mutable.update { it.copy(notice="Sign-in link sent. Open it on this device.") } }
+ fun google(activity:Activity)=run {
+  try { auth.google(activity) } catch(_:GetCredentialCancellationException) { return@run }
+  signedIn()
+ }
+ fun email(address:String)=run {
+  auth.email(address.trim())
+  mutable.update { it.copy(notice="Sign-in link sent. Check your inbox and spam folder, then open the link on this device. If it opens in a browser, copy the original link from the email and paste it here.") }
+ }
+ fun finishEmailSignIn(address:String,link:String)=run {
+  require(auth.complete(link.trim(),address)) { "Copy the original sign-in link from the email and try again." }
+  signedIn()
+  mutable.update { it.copy(notice="Signed in.") }
+ }
  fun link(uri:Uri)=run {
   uri.getQueryParameter("groupId")?.let { pendingInvite=it;settings.pendingGroup(it) }
-  val nested=uri.getQueryParameter("link") ?: uri.toString()
-  if(auth.complete(nested)) signedIn()
-  if(auth.user!=null) joinPending() else mutable.update { it.copy(notice="Sign in with the invited email to join this group.") }
+  val nested=uri.getQueryParameter("link")
+  if(auth.complete(uri.toString()) || (nested!=null && auth.complete(nested))) {
+   signedIn()
+   mutable.update { it.copy(notice="Signed in.") }
+  } else if(auth.user!=null) {
+   joinPending()
+  } else {
+   mutable.update { it.copy(notice="Sign in with the invited email to join this group.") }
+  }
  }
  private suspend fun signedIn() { mutable.update { it.copy(signedIn=true,email=auth.user?.email.orEmpty()) };observeGroups();joinPending() }
  private suspend fun joinPending() { (pendingInvite ?: settings.pendingGroup.first().ifBlank { null })?.let { backend.join(it);pendingInvite=null;settings.pendingGroup("");mutable.update { s -> s.copy(notice="Invitation accepted.") } } }

@@ -7,7 +7,8 @@
       "namespace": "android_app",
       "package_name": "com.coread.app",
       "sha256_cert_fingerprints": [
-        "9D:9A:45:34:65:48:89:25:DF:3F:37:D7:3F:6C:28:C9:AE:61:69:CF:52:F8:01:BB:88:9F:AC:50:D5:6C:0B:98"
+        "9D:9A:45:34:65:48:89:25:DF:3F:37:D7:3F:6C:28:C9:AE:61:69:CF:52:F8:01:BB:88:9F:AC:50:D5:6C:0B:98",
+        "30:BD:93:06:94:60:5E:19:5F:C1:C1:7D:E4:8E:4F:9A:63:2B:A0:26:4F:5A:A9:A4:9D:37:C4:F1:81:12:F0:A2"
       ]
     }
   }
